@@ -89,20 +89,20 @@ type Config struct {
 // whether or not to do so based on information obtained from daemon and
 // wallet chain servers.
 type TicketPurchaser struct {
-	cfg              *Config
-	activeNet        *chaincfg.Params
-	dcrdChainSvr     *dcrrpcclient.Client
-	wallet           *wallet.Wallet
-	ticketAddress    dcrutil.Address
-	poolAddress      dcrutil.Address
-	firstStart       bool
-	windowPeriod     int          // The current window period
-	idxDiffPeriod    int          // Relative block index within the difficulty period
-	useMedian        bool         // Flag for using median for ticket fees
-	priceMode        avgPriceMode // Price mode to use to calc average price
-	heightCheck      map[int64]struct{}
-	balEstimated     dcrutil.Amount
-	ticketPrice      dcrutil.Amount
+	cfg           *Config
+	activeNet     *chaincfg.Params
+	dcrdChainSvr  *dcrrpcclient.Client
+	wallet        *wallet.Wallet
+	ticketAddress dcrutil.Address
+	poolAddress   dcrutil.Address
+	firstStart    bool
+	windowPeriod  int          // The current window period
+	idxDiffPeriod int          // Relative block index within the difficulty period
+	useMedian     bool         // Flag for using median for ticket fees
+	priceMode     avgPriceMode // Price mode to use to calc average price
+	heightCheck   map[int64]struct{}
+	balEstimated  dcrutil.Amount
+	//ticketPrice      dcrutil.Amount
 	stakePoolSize    uint32
 	stakeLive        uint32
 	stakeImmature    uint32
@@ -155,15 +155,9 @@ func NewTicketPurchaser(cfg *Config,
 
 // PurchaseStats stats is a collection of statistics related to the ticket purchase.
 type PurchaseStats struct {
-	Height        int64
-	PriceMaxScale float64
-	PriceAverage  float64
-	PriceNext     float64
-	PriceCurrent  float64
-	Purchased     int
-	LeftWindow    int
-	Balance       int64
-	TicketPrice   int64
+	Height     int64
+	Purchased  int
+	LeftWindow int
 }
 
 // Purchase is the main handler for purchasing tickets for the user.
@@ -171,20 +165,29 @@ type PurchaseStats struct {
 func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 
 	ps := &PurchaseStats{Height: height}
-	// Check to make sure that the current height has not already been seen
-	// for a reorg or a fork
+
+	//
+	// Startup checks
+
+	if t.wallet.Locked() {
+		return ps, fmt.Errorf("Wallet not unlocked to allow ticket purchases")
+	}
+	avgPriceAmt, err := t.calcAverageTicketPrice(height)
+	if err != nil {
+		return ps, fmt.Errorf("Failed to calculate average ticket price amount: %s",
+			err.Error())
+	}
+
+	// Check to make sure that the current height has not already been seen for a reorg or a fork
 	if _, exists := t.heightCheck[height]; exists {
-		log.Debugf("We've already seen this height, "+
-			"reorg/fork detected at height %v", height)
+		log.Debugf("We've already seen this height, reorg/fork detected at height %v", height)
 		return ps, nil
 	}
 	t.heightCheck[height] = struct{}{}
 
 	// Initialize based on where we are in the window
 	winSize := t.activeNet.StakeDiffWindowSize
-	thisIdxDiffPeriod := int(height % winSize)
-	nextIdxDiffPeriod := int((height + 1) % winSize)
-	thisWindowPeriod := int(height / winSize)
+	maxStake := int(t.activeNet.MaxFreshStakePerBlock)
 
 	refreshStakeInfo := false
 	if t.firstStart {
@@ -193,22 +196,78 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 		log.Debugf("Transaction relay fee: %v DCR", t.cfg.TxFee)
 		refreshStakeInfo = true
 	} else {
-		if nextIdxDiffPeriod == 0 {
+		if int((height+3)%winSize) == 0 {
+			log.Debugf("***Last time to buy is now")
+		}
+		if int((height+2)%winSize) == 0 {
 			// Starting a new window
-			log.Debugf("Resetting stake window variables")
+			log.Debugf("**No more buying")
+			log.Debugf("**You last pre-tx generations were mined and your last sstxs will mine in the next block")
+		}
+		if int((height+1)%winSize) == 0 {
+			// can not buy last bloc, ref dcrticketbuyer/issues/66
+			log.Debugf("**The last stake window is complete. The next block is a new stake difficulty")
+			log.Debugf("**Resetting stake window variables")
 			refreshStakeInfo = true
 		}
-		if thisIdxDiffPeriod != 0 && thisWindowPeriod > t.windowPeriod {
+		if int(height%winSize) != 0 && int(height/winSize) > t.windowPeriod {
 			// Disconnected and reconnected in a different window
-			log.Debugf("Reconnected in a different window, now at height %v", height)
+			log.Debugf("**Reconnected in a different window, now at height %v", height)
 			refreshStakeInfo = true
 		}
 	}
 
-	// Set these each round
+	//
+	// Load needed information
+	//
+
 	t.idxDiffPeriod = int(height % winSize)
 	t.windowPeriod = int(height / winSize)
+	account, err := t.wallet.AccountNumber(t.cfg.AccountName)
+	if err != nil {
+		return ps, err
+	}
+	bal, err := t.wallet.CalculateAccountBalance(account, 0)
+	if err != nil {
+		return ps, err
+	}
+	memPoolOwn, err := t.ownTicketsInMempool()
+	if err != nil {
+		return ps, err
+	}
+	memPoolAll, err := t.allTicketsInMempool()
+	if err != nil {
+		return ps, err
+	}
+	estStakeDiff, err := t.dcrdChainSvr.EstimateStakeDiff(nil)
+	if err != nil {
+		return ps, err
+	}
+	nextStakeDiff, err := t.wallet.StakeDifficulty()
+	if err != nil {
+		return ps, err
+	}
+	oneBlock := uint32(1)
+	ticketFeeInfo, err := t.dcrdChainSvr.TicketFeeInfo(&oneBlock, &zeroUint32)
+	if err != nil {
+		return ps, err
+	}
+	if len(ticketFeeInfo.FeeInfoBlocks) < 1 {
+		return ps, fmt.Errorf("feeinfo blocks bad length")
+	}
+	ticketPurchasesInLastBlock := int(ticketFeeInfo.FeeInfoBlocks[0].Number)
 
+	blocksRemaining := int(winSize) - t.idxDiffPeriod - 2
+	if blocksRemaining < 1 {
+		log.Infof("No blocks remaining to buy")
+		return ps, nil
+	}
+
+	//
+	// Decide what values to use
+	//
+
+	// cache stakeinfo
 	if refreshStakeInfo {
 		log.Debugf("Getting StakeInfo")
 		var curStakeInfo *wallet.StakeInfoData
@@ -236,165 +295,23 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 		subsidyCache := blockchain.NewSubsidyCache(height, t.wallet.ChainParams())
 		subsidy := blockchain.CalcStakeVoteSubsidy(subsidyCache, height, t.wallet.ChainParams())
 		t.stakeVoteSubsidy = dcrutil.Amount(subsidy)
-		log.Tracef("Stake vote subsidy: %v", t.stakeVoteSubsidy)
+		log.Debugf("Stake vote subsidy: %v", t.stakeVoteSubsidy)
+		proportionLive := float64(t.stakeLive) / float64(t.stakePoolSize)
+		log.Debugf("Proportion live: %.8f%%", proportionLive)
+		// 24 hours * 60 minutes in a day
+		generatedPerDay := t.stakeVoteSubsidy.ToCoin() * float64(t.activeNet.TicketsPerBlock) *
+			(24 * 60 / float64(t.activeNet.TargetTimePerBlock.Minutes())) * proportionLive
+		log.Debugf("Stake revenue per day: ~%.8f DCR (minus fees)", generatedPerDay)
 	}
 
-	// Parse the ticket purchase frequency. Positive numbers mean
-	// that many tickets per block. Negative numbers mean to only
-	// purchase one ticket once every abs(num) blocks.
-	maxPerBlock := 0
-	switch {
-	case t.cfg.MaxPerBlock == 0:
-		return ps, nil
-	case t.cfg.MaxPerBlock > 0:
-		maxPerBlock = t.cfg.MaxPerBlock
-	case t.cfg.MaxPerBlock < 0:
-		if int(height)%t.cfg.MaxPerBlock != 0 {
-			return ps, nil
-		}
-		maxPerBlock = 1
-	}
-
-	// Make sure that our wallet is connected to the daemon and the
-	// wallet is unlocked, otherwise abort.
-	// TODO: Check daemon connected
-	if t.wallet.Locked() {
-		return ps, fmt.Errorf("Wallet not unlocked to allow ticket purchases")
-	}
-
-	avgPriceAmt, err := t.calcAverageTicketPrice(height)
-	if err != nil {
-		return ps, fmt.Errorf("Failed to calculate average ticket price amount: %s",
-			err.Error())
-	}
-	avgPrice := avgPriceAmt.ToCoin()
-	log.Debugf("Calculated average ticket price: %v", avgPriceAmt)
-	ps.PriceAverage = avgPrice
-
-	nextStakeDiff, err := t.wallet.StakeDifficulty()
-	log.Tracef("Next stake difficulty: %v", nextStakeDiff)
-	if err != nil {
-		return ps, err
-	}
-	ps.PriceCurrent = float64(nextStakeDiff)
-	t.ticketPrice = nextStakeDiff
-	ps.TicketPrice = int64(nextStakeDiff)
-
-	sDiffEsts, err := t.dcrdChainSvr.EstimateStakeDiff(nil)
-	if err != nil {
-		return ps, err
-	}
-	ps.PriceNext = sDiffEsts.Expected
-	log.Tracef("Estimated stake diff: (min: %v, expected: %v, max: %v)",
-		sDiffEsts.Min, sDiffEsts.Expected, sDiffEsts.Max)
-
-	// Set the max price to the configuration parameter that is lower
-	// Absolute or relative max price
-	var maxPriceAmt dcrutil.Amount
-	if t.cfg.MaxPriceAbsolute > 0 && t.cfg.MaxPriceAbsolute < avgPrice*t.cfg.MaxPriceRelative {
-		maxPriceAmt, err = dcrutil.NewAmount(t.cfg.MaxPriceAbsolute)
-		if err != nil {
-			return ps, err
-		}
-		log.Debugf("Using absolute max price: %v", maxPriceAmt)
-	} else {
-		maxPriceAmt, err = dcrutil.NewAmount(avgPrice * t.cfg.MaxPriceRelative)
-		if err != nil {
-			return ps, err
-		}
-		log.Debugf("Using relative max price: %v", maxPriceAmt)
-	}
-
-	// Scale the average price according to the configuration parameters
-	// to find the maximum price for users that are electing to
-	// attempting to manipulate the stake difficulty
-	maxPriceScaledAmt, err := dcrutil.NewAmount(t.cfg.MaxPriceScale * avgPrice)
-	if err != nil {
-		return ps, err
-	}
-	if t.cfg.MaxPriceScale > 0.0 {
-		log.Debugf("Max price to maintain this window: %v", maxPriceScaledAmt)
-	}
-	ps.PriceMaxScale = maxPriceScaledAmt.ToCoin()
-
-	account, err := t.wallet.AccountNumber(t.cfg.AccountName)
-	if err != nil {
-		return ps, err
-	}
-	bal, err := t.wallet.CalculateAccountBalance(account, 0)
-	if err != nil {
-		return ps, err
-	}
-	log.Debugf("Spendable balance for account '%s': %v", t.cfg.AccountName, bal.Spendable)
-	ps.Balance = int64(bal.Spendable)
-
-	// Disable purchasing if the ticket price is too high based on
-	// the cutoff or if the estimated ticket price is above
-	// our scaled cutoff based on the ideal ticket price.
-	if nextStakeDiff > maxPriceAmt {
-		log.Infof("Not buying because max price exceeded: "+
-			"(max price: %v, ticket price: %v)", maxPriceAmt, nextStakeDiff)
-		return ps, nil
-	}
-	if t.cfg.MaxPriceScale > 0.0 && (sDiffEsts.Expected > maxPriceScaledAmt.ToCoin()) &&
-		maxPriceScaledAmt != 0 {
-		log.Infof("Not buying because the "+
-			"next window estimate %v DCR is higher than the scaled max "+
-			"price %v", sDiffEsts.Expected, maxPriceScaledAmt)
-		return ps, nil
-	}
-
-	// If we still have tickets in the memory pool, don't try
-	// to buy even more tickets.
-	inMP, err := t.ownTicketsInMempool()
-	if err != nil {
-		return ps, err
-	}
-	log.Tracef("Own tickets in mempool: %v", inMP)
-	if !t.cfg.DontWaitForTickets {
-		if inMP >= t.cfg.MaxInMempool {
-			log.Infof("Currently waiting for %v tickets to enter the "+
-				"blockchain before buying more tickets (in mempool: %v,"+
-				" max allowed in mempool %v)", inMP-t.cfg.MaxInMempool,
-				inMP, t.cfg.MaxInMempool)
-			return ps, nil
-		}
-	}
-
-	// Lookup how many tickets purchase slots were filled in the last block
-	oneBlock := uint32(1)
-	info, err := t.dcrdChainSvr.TicketFeeInfo(&oneBlock, &zeroUint32)
-	if err != nil {
-		return ps, err
-	}
-	if len(info.FeeInfoBlocks) < 1 {
-		return ps, fmt.Errorf("error FeeInfoBlocks bad length")
-	}
-	ticketPurchasesInLastBlock := int(info.FeeInfoBlocks[0].Number)
-	log.Tracef("Ticket purchase slots filled in last block: %v", ticketPurchasesInLastBlock)
-
-	// Expensive call to fetch all tickets in the mempool
-	mempoolall, err := t.allTicketsInMempool()
-	if err != nil {
-		return ps, err
-	}
-	log.Tracef("All tickets in mempool: %v", mempoolall)
-
+	// find and set scaled ticket fee
 	var feeToUse float64
-	maxStake := int(t.activeNet.MaxFreshStakePerBlock)
-	if ticketPurchasesInLastBlock < maxStake && mempoolall < maxStake {
+	if ticketPurchasesInLastBlock < maxStake && memPoolAll < maxStake {
 		log.Debugf("Using min ticket fee: %.8f DCR", t.cfg.MinFee)
 		feeToUse = t.cfg.MinFee
-		if ticketPurchasesInLastBlock < maxStake {
-			log.Tracef("(ticket purchase slots available in last block)")
-		}
-		if mempoolall < maxStake {
-			log.Tracef("(total tickets in mempool is less than max per block)")
-		}
 	} else {
-		// If might be the case that there weren't enough recent
-		// blocks to average fees from. Use data from the last
-		// window with the closest difficulty.
+		// if not enough recent blocks to average fees, use data from the last
+		// window with the closest difficulty
 		chainFee := 0.0
 		if t.idxDiffPeriod < t.cfg.BlocksToAvg {
 			chainFee, err = t.findClosestFeeWindows(nextStakeDiff.ToCoin(),
@@ -408,9 +325,7 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 				return ps, err
 			}
 		}
-
-		// Scale the mean fee upwards according to what was asked
-		// for by the user.
+		// Scale the mean fee upwards according to what was asked for by the user.
 		feeToUse = chainFee * t.cfg.FeeTargetScaling
 		log.Tracef("Average ticket fee: %.8f DCR", chainFee)
 		if feeToUse > t.cfg.MaxFee {
@@ -450,118 +365,229 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 		log.Debugf("Using relative balancetomaintain: %v", balanceToMaintainAmt)
 	}
 
-	// Calculate how many tickets to buy
-	ticketsLeftInWindow := (int(winSize) - t.idxDiffPeriod) * int(t.activeNet.MaxFreshStakePerBlock)
-	log.Tracef("Ticket allotment left in window is %v, blocks left is %v",
-		ticketsLeftInWindow, (int(winSize) - t.idxDiffPeriod))
+	// maxperblock. positive numbers mean that many tickets per block.
+	// negative numbers mean to only purchase one ticket once every abs(num) blocks.
+	maxPerBlock := 0
+	switch {
+	case t.cfg.MaxPerBlock == 0:
+		return ps, nil
+	case t.cfg.MaxPerBlock > 0:
+		maxPerBlock = t.cfg.MaxPerBlock
+	case t.cfg.MaxPerBlock < 0:
+		if int(height)%t.cfg.MaxPerBlock != 0 {
+			return ps, nil
+		}
+		maxPerBlock = 1
+	}
 
+	targetPrice := avgPriceAmt.ToCoin()
+	//targetPrice = nextStakeDiff.ToCoin()
+	if t.cfg.PriceTarget > 0.0 {
+		targetPrice = t.cfg.PriceTarget
+		log.Tracef("Using target price: %v", targetPrice)
+	}
+
+	var maxPriceAmt dcrutil.Amount
+	if t.cfg.MaxPriceAbsolute > 0 && t.cfg.MaxPriceAbsolute < targetPrice*t.cfg.MaxPriceRelative {
+		maxPriceAmt, err = dcrutil.NewAmount(t.cfg.MaxPriceAbsolute)
+		if err != nil {
+			return ps, err
+		}
+		log.Debugf("Using absolute max price: %v", maxPriceAmt)
+	} else {
+		maxPriceAmt, err = dcrutil.NewAmount(targetPrice * t.cfg.MaxPriceRelative)
+		if err != nil {
+			return ps, err
+		}
+		log.Debugf("Using relative max price: %v", maxPriceAmt)
+	}
+
+	// config
+	BASE_RESERVE := 2.5         // amount of funds to keep in reserve measured by spendPerWindows
+	MAX_PRICE_MULTIPLIER := 5.0 // a hack to scale up the max price when your reverse funds are growing
+
+	windowRatio := float64(t.idxDiffPeriod) / float64(winSize) // how far into the window we are
+	// calculate dynamic price target scaling
+	// note, winperiods for mainnet: 8192 / 144 =  ~56.88  (~28.44 days)
+	avgWinPeriods := float64(t.activeNet.TicketPoolSize) / float64(winSize) // win periods per investment maturity
+	spendPerWindow := bal.Total.ToCoin() / avgWinPeriods                    // how much we should be spending per window
+	fundsRatio := bal.Spendable.ToCoin() / spendPerWindow                   // how much we have over how much we should have at this point
+
+	// Max price multiplied
+	var maxPriceMlt dcrutil.Amount
+	maxPriceMlt, err = dcrutil.NewAmount(fundsRatio * MAX_PRICE_MULTIPLIER)
+	maxPriceAmt = maxPriceAmt + maxPriceMlt
+	log.Debugf("Using max price multiplied: %v", maxPriceAmt)
+	if err != nil {
+		return ps, err
+	}
+
+	maxPriceScale := ((1 / avgWinPeriods) * (fundsRatio - BASE_RESERVE)) + 1
+	scaledTargetPrice := targetPrice * maxPriceScale
 	toBuyForBlock := int(math.Floor((bal.Spendable.ToCoin() - balanceToMaintainAmt.ToCoin()) / nextStakeDiff.ToCoin()))
 	if toBuyForBlock < 0 {
 		toBuyForBlock = 0
 	}
-	if toBuyForBlock == 0 {
-		log.Infof("Not enough funds to buy tickets: (spendable: %v, balancetomaintain: %v) ",
-			bal.Spendable.ToCoin(), balanceToMaintainAmt.ToCoin())
+	proportionLive := float64(t.stakeLive) / float64(t.stakePoolSize)
+	tixWillRedeem := float64(blocksRemaining) * float64(t.activeNet.TicketsPerBlock) * proportionLive
+	yourAvgTixPrice := 0.0
+	if t.stakeLive+t.stakeImmature != 0 {
+		yourAvgTixPrice = bal.LockedByTickets.ToCoin() / float64(t.stakeLive+t.stakeImmature)
+	}
+	redeemedFunds := tixWillRedeem * yourAvgTixPrice
+	stakeRewardFunds := tixWillRedeem * t.stakeVoteSubsidy.ToCoin()
+	tixToBuyWithRedeemedFunds := redeemedFunds / nextStakeDiff.ToCoin()
+	tixToBuyWithStakeRewardFunds := stakeRewardFunds / nextStakeDiff.ToCoin()
+	tixCanBuy := (bal.Spendable.ToCoin() - balanceToMaintainAmt.ToCoin()) / nextStakeDiff.ToCoin()
+	if tixCanBuy < 0 {
+		tixCanBuy = 0
+	}
+	tixCanBuyAll := tixCanBuy + tixToBuyWithRedeemedFunds + tixToBuyWithStakeRewardFunds
+	buyPerBlockAll := tixCanBuyAll / float64(blocksRemaining)
+	ticketsLeftInWindow := (int(winSize) - t.idxDiffPeriod - 1) * maxStake
+	purchaseSlotsLeftInWindow := blocksRemaining * maxStake
+	proportionPossible := (float64(t.stakeLive) + float64(tixCanBuy)) / float64(t.stakePoolSize)
+
+	canBuyRatio := tixCanBuy / float64(purchaseSlotsLeftInWindow)
+	canBuyAllRatio := tixCanBuyAll / float64(purchaseSlotsLeftInWindow)
+	stakeDiffCanReach := ((estStakeDiff.Max - estStakeDiff.Min) * canBuyRatio) + estStakeDiff.Min
+	stakeDiffCanReachAll := ((estStakeDiff.Max - estStakeDiff.Min) * canBuyAllRatio) + estStakeDiff.Min
+
+	//
+	// Output what is known
+	//
+
+	log.Tracef("Activenet: (tixpoolsize: %v, winSize: %v, avgWinPeriods: %.2f)", t.activeNet.TicketPoolSize, winSize, avgWinPeriods)
+	log.Tracef("--idxDiffPeriod %v (starts at 0), Window period %v, Window %.0f%% complete--", t.idxDiffPeriod, t.windowPeriod, windowRatio*100)
+	log.Tracef("Balance for account '%s': (Available: %.2f DCR, Spendable: %.2f DCR, Total: %.2f DCR)",
+		t.cfg.AccountName, bal.Spendable.ToCoin()-balanceToMaintainAmt.ToCoin(), bal.Spendable.ToCoin(), bal.Total.ToCoin())
+	log.Tracef("Your spend per window: %.2f, Funds ratio: %.3f windows worth", spendPerWindow, fundsRatio)
+	log.Tracef("Proportion Live: %.0f%%, Proportion Possible: %.0f%%", proportionLive*100, proportionPossible*100)
+	log.Tracef("Tickets: (Mempool all: %v, Mempool own: %v, Last block: %v)", memPoolAll, memPoolOwn, ticketPurchasesInLastBlock)
+	log.Tracef("Average ticket price (All: %.2f DCR, Yours: %.2f DCR)", avgPriceAmt.ToCoin(), yourAvgTixPrice)
+	log.Tracef("Next stake difficulty: %.2f DCR", nextStakeDiff.ToCoin())
+	log.Tracef("Dynamic price target: (Scale: %.0f%%, Amount: %.3f DCR)", maxPriceScale*100, scaledTargetPrice)
+	log.Debugf("Estimated stake diff: (min: %v, expected: %v, max: %v)",
+		estStakeDiff.Min, estStakeDiff.Expected, estStakeDiff.Max)
+	log.Debugf("Expected value: (Redeem %.2f DCR, buys %.1f tickets) (PoS Reward %.2f DCR, buys %.1f tickets)",
+		redeemedFunds, tixToBuyWithRedeemedFunds, stakeRewardFunds, tixToBuyWithStakeRewardFunds)
+	log.Debugf("Ticket slots left in window is %v (usable: %v), blocks left is %v (usable: %v)",
+		ticketsLeftInWindow, purchaseSlotsLeftInWindow, (int(winSize) - t.idxDiffPeriod - 1), blocksRemaining)
+	log.Infof("Can buy now (price target: %.2f DCR, total tix: %.1f, tix per block: %.1f)",
+		stakeDiffCanReach, tixCanBuy, float64(maxStake)*canBuyRatio)
+	log.Infof("Can buy all (price target: %.2f DCR, total tix: %.1f, tix per block: %.1f)",
+		stakeDiffCanReachAll, tixCanBuyAll, float64(maxStake)*canBuyAllRatio)
+
+	//
+	// Main calculation block
+	//
+
+	if t.cfg.SpreadTicketPurchases && toBuyForBlock > 0 {
+		if blocksRemaining > 0 && tixCanBuy > 0 {
+			rand.Seed(time.Now().UTC().UnixNano())
+			ticketRemainder := buyPerBlockAll - math.Floor(buyPerBlockAll)
+			if rand.Float64() <= float64(ticketRemainder) {
+				toBuyForBlock++
+			}
+		}
 	}
 
-	// For spreading your ticket purchases evenly throughout window.
-	// Use available funds to calculate how many tickets to buy, and also
-	// approximate the income you're going to have from older tickets that
-	// you've voted and are maturing during this window
-	if t.cfg.SpreadTicketPurchases && toBuyForBlock > 0 {
-		log.Debugf("Spreading purchases throughout window")
+	// Limit the amount of tickets you are buying per block so that you do not exceed maxpricescale
+	if t.cfg.MaxPriceScale > 0.0 {
+		// find the tickets needed to reach max price scale
+		needRatio := (scaledTargetPrice - estStakeDiff.Min) / (estStakeDiff.Max - estStakeDiff.Min)
+		needThisWindow := float64(purchaseSlotsLeftInWindow) * needRatio
+		willTargetStakeDiff := ((estStakeDiff.Max - estStakeDiff.Min) * needRatio) + estStakeDiff.Min
+		log.Infof("Want Target (price target: %.2f DCR: total tix: %.1f, tix per block: %.1f)",
+			willTargetStakeDiff, needThisWindow, float64(maxStake)*needRatio)
 
-		// same as proportionlive that getstakeinfo rpc shows
-		proportionLive := float64(t.stakeLive) / float64(t.stakePoolSize)
-		// Number of blocks remaining to purchase tickets in this window
-		blocksRemaining := int(winSize) - t.idxDiffPeriod
-		// Estimated number of tickets you will vote on and redeem this window
-		tixWillRedeem := float64(blocksRemaining) * float64(t.activeNet.TicketsPerBlock) * proportionLive
-		// Average price of your tickets in the pool
-		yourAvgTixPrice := 0.0
-		if t.stakeLive+t.stakeImmature != 0 {
-			yourAvgTixPrice = bal.LockedByTickets.ToCoin() / float64(t.stakeLive+t.stakeImmature)
-		}
-		// Estimated amount of funds to redeem in the remaining window
-		redeemedFunds := tixWillRedeem * yourAvgTixPrice
-		// Estimated amount of funds becoming available from stake vote reward
-		stakeRewardFunds := tixWillRedeem * t.stakeVoteSubsidy.ToCoin()
-		// Estimated number of tickets to be bought with redeemed funds
-		tixToBuyWithRedeemedFunds := redeemedFunds / nextStakeDiff.ToCoin()
-		// Estimated number of tickets to be bought with stake reward
-		tixToBuyWithStakeRewardFunds := stakeRewardFunds / nextStakeDiff.ToCoin()
-		// Amount of tickets that can be bought with existing funds
-		tixCanBuy := (bal.Spendable.ToCoin() - balanceToMaintainAmt.ToCoin()) / nextStakeDiff.ToCoin()
-		if tixCanBuy < 0 {
-			tixCanBuy = 0
-		}
-		// Estimated number of tickets you can buy with current funds and
-		// funds from incoming redeemed tickets
-		tixCanBuyAll := tixCanBuy + tixToBuyWithRedeemedFunds + tixToBuyWithStakeRewardFunds
-		// Amount of tickets that can be bought per block with current funds
-		buyPerBlock := tixCanBuy / float64(blocksRemaining)
-		// Amount of tickets that can be bought per block with current and redeemed funds
-		buyPerBlockAll := tixCanBuyAll / float64(blocksRemaining)
+		// This will be for targeting subsequent window prices to get the price to fall back
+		// to our stable target range. Needs to connect to estimatestakediff algo for values
+		/*
+			multipliers := make([]float64, 4)
+			multipliers[0] = 1.25
+			multipliers[1] = 2.0
+			multipliers[2] = 3.0
+			multipliers[3] = 4.0
 
-		log.Debugf("Your average purchase price for tickets in the pool is %.2f DCR", yourAvgTixPrice)
-		log.Debugf("Available funds of %.2f DCR can buy %.2f tickets, %.2f tickets per block",
-			bal.Spendable.ToCoin()-balanceToMaintainAmt.ToCoin(), tixCanBuy, buyPerBlock)
-		log.Debugf("With %.2f%% proportion live, you will redeem ~%.2f tickets in the remaining %d blocks",
-			proportionLive*100, tixWillRedeem, blocksRemaining)
-		log.Debugf("Redeemed ticket value expected is %.2f DCR, buys %.2f tickets, %.2f%% more",
-			redeemedFunds, tixToBuyWithRedeemedFunds, tixToBuyWithRedeemedFunds/tixCanBuy*100)
-		log.Debugf("Stake reward expected is %.2f DCR, buys %.2f tickets, %.2f%% more",
-			stakeRewardFunds, tixToBuyWithStakeRewardFunds, tixToBuyWithStakeRewardFunds/tixCanBuy*100)
-		log.Infof("Will buy ~%.2f tickets per block, %.2f ticket purchases remain this window", buyPerBlockAll, tixCanBuyAll)
-
-		if blocksRemaining > 0 && tixCanBuy > 0 {
-			// rand is for the remainder
-			// if 1.25 buys per block are needed, then buy 2 tickets 1/4th of the time
-			rand.Seed(time.Now().UTC().UnixNano())
-
-			if tixCanBuyAll >= float64(blocksRemaining) {
-				// When buying one or more tickets per block
-				toBuyForBlock = int(math.Floor(buyPerBlockAll))
-				ticketRemainder := int(math.Floor(tixCanBuyAll)) % blocksRemaining
-				if rand.Float64() <= float64(ticketRemainder) {
-					toBuyForBlock++
-				}
-			} else {
-				// When buying less than one ticket per block
-				if rand.Float64() <= buyPerBlockAll {
-					log.Debugf("Buying one this round")
-					toBuyForBlock = 1
+			var tmpneedRatio float64
+			var tmpneedThisWindow float64
+			var tmpwillTargetStakeDiff float64
+			for _, multiplier := range multipliers {
+				priceMult := scaledTargetPrice * multiplier
+				if priceMult <= estStakeDiff.Min {
+					log.Debugf("Undr min %.1f multiplier %.2f DCR", multiplier, priceMult)
+				} else if priceMult > estStakeDiff.Min && priceMult < estStakeDiff.Max {
+					tmpneedRatio = (priceMult - estStakeDiff.Min) / (estStakeDiff.Max - estStakeDiff.Min)
+					tmpneedThisWindow = float64(purchaseSlotsLeftInWindow) * tmpneedRatio
+					if tmpneedThisWindow <= tixCanBuyAll {
+						needRatio = tmpneedRatio
+						needThisWindow = tmpneedThisWindow
+						scaledTargetPrice = priceMult
+						willTargetStakeDiff = ((estStakeDiff.Max - estStakeDiff.Min) * needRatio) + estStakeDiff.Min
+						log.Tracef("== Using %.1f multiplier, %.2f", multiplier, scaledTargetPrice)
+						log.Infof("Want Target (price target: %.2f DCR: total tix: %.1f, tix per block: %.1f)",
+							willTargetStakeDiff, needThisWindow, float64(maxStake)*needRatio)
+					} else {
+						tmpwillTargetStakeDiff = ((estStakeDiff.Max - estStakeDiff.Min) * tmpneedRatio) + estStakeDiff.Min
+						log.Debugf("Not Poss %.1f multiplier for %.2f (price target: %.2f DCR: total tix: %.1f, tix per block: %.1f)",
+							multiplier, scaledTargetPrice*multiplier, tmpwillTargetStakeDiff, tmpneedThisWindow, float64(maxStake)*tmpneedRatio)
+					}
 				} else {
-					toBuyForBlock = 0
-					log.Debugf("Skipping this round")
+					log.Debugf("Over max %.1f multiplier %.2f DCR", multiplier, scaledTargetPrice*multiplier)
 				}
 			}
-			// This is for a possible rare case where there is not enough available funds to
-			// purchase a ticket because funds expected from redeemed tickets are overdue
-			if toBuyForBlock > int(math.Floor(tixCanBuy)) {
-				log.Debugf("Waiting for current windows tickets to redeem")
-				log.Debugf("Cant yet buy %d, will buy %d",
-					toBuyForBlock, int(math.Floor(tixCanBuy)))
-				toBuyForBlock = int(math.Floor(tixCanBuy))
+		*/
+
+		// if what we were planning to buy is greater then what we need to stay within
+		// our target price, then calc the new lower amount to buy per block and use that
+		var ratio float64
+		if canBuyRatio < needRatio {
+			ratio = canBuyRatio
+		} else {
+			ratio = needRatio
+		}
+
+		toBuyForBlockFloat := float64(maxStake) * ratio
+		if float64(toBuyForBlock) > toBuyForBlockFloat {
+			rand.Seed(time.Now().UTC().UnixNano())
+			toBuyForBlock = int(math.Floor(toBuyForBlockFloat))
+			ticketRemainder := toBuyForBlockFloat - math.Floor(toBuyForBlockFloat)
+			if rand.Float64() <= float64(ticketRemainder) {
+				toBuyForBlock++
 			}
 		} else {
-			// Do not buy any tickets
-			toBuyForBlock = 0
-			if tixCanBuy < 0 {
-				log.Debugf("tixCanBuy < 0, this should not occur")
-			} else if tixCanBuy < 1 {
-				log.Debugf("Not enough funds to purchase a ticket")
+			// This is the case where the price target is so far out of reach
+			// that we just dont even bother trying
+			if stakeDiffCanReach/scaledTargetPrice < 1-proportionPossible {
+				return ps, fmt.Errorf("Not buying because can not reach price target")
 			}
-			if blocksRemaining < 0 {
-				log.Debugf("blocksRemaining < 0, this should not occur")
-			} else if blocksRemaining == 0 {
-				log.Debugf("There are no more opportunities to purchase tickets in this window")
-			}
+		}
+		// Log scale slope up for dynamic price target
+		exponent := 1 / ratio
+		if float64(blocksRemaining) < exponent {
+			exponent = float64(blocksRemaining)
+		}
+		log.Tracef("trace, canbuyRatio %v", canBuyRatio)
+		log.Tracef("trace, pre-ratio %+v", ratio)
+		ratio = math.Pow(ratio, exponent)
+		log.Tracef("trace, ratio %+v", ratio)
+		log.Tracef("trace, exponent %v", exponent)
+		toBuyForBlockFloat = float64(maxStake) * ratio
+		log.Infof("Log scale buying, %.8f now and slope up (log ratio: %.8f)", toBuyForBlockFloat, ratio)
+		rand.Seed(time.Now().UTC().UnixNano())
+		toBuyForBlock = int(math.Floor(toBuyForBlockFloat))
+		ticketRemainder := toBuyForBlockFloat - float64(toBuyForBlock)
+		if rand.Float64() <= float64(ticketRemainder) {
+			toBuyForBlock++
 		}
 	}
 
-	// Only the maximum number of tickets at each block
-	// should be purchased, as specified by the user.
+	//
+	// Post checks
+	//
+
+	// only the maximum number of tickets at each block should be purchased, as specified by the user
 	if toBuyForBlock > maxPerBlock {
 		toBuyForBlock = maxPerBlock
 		if maxPerBlock == 1 {
@@ -570,17 +596,45 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 			log.Infof("Limiting to %d purchases so that maxperblock is not exceeded", maxPerBlock)
 		}
 	}
-
-	// We've already purchased all the tickets we need to.
+	if !t.cfg.DontWaitForTickets {
+		if toBuyForBlock+memPoolOwn > t.cfg.MaxInMempool {
+			toBuyForBlock = t.cfg.MaxInMempool - memPoolOwn
+			log.Debugf("Limiting to %d purchases so that maxinmempool is not exceeded", toBuyForBlock)
+		}
+	}
+	if nextStakeDiff > maxPriceAmt {
+		log.Infof("Not buying because max price exceeded: "+
+			"(max price: %v, ticket price: %v)", maxPriceAmt, nextStakeDiff)
+		return ps, nil
+	}
+	if t.cfg.MaxPriceScale > 0.0 && (estStakeDiff.Expected > scaledTargetPrice) {
+		log.Infof("Not buying because the next window estimate %v DCR is higher than "+
+			"the scaled max price %v", estStakeDiff.Expected, scaledTargetPrice)
+		return ps, nil
+	}
+	if !t.cfg.DontWaitForTickets {
+		if memPoolOwn >= t.cfg.MaxInMempool {
+			log.Infof("Currently waiting for %v tickets to enter the "+
+				"blockchain before buying more tickets (in mempool: %v,"+
+				" max allowed in mempool %v)", memPoolOwn-t.cfg.MaxInMempool,
+				memPoolOwn, t.cfg.MaxInMempool)
+			return ps, nil
+		}
+	}
+	//fix this
+	//also, structure to show all errors
+	/*
+		if toBuyForBlock == 0 {
+			log.Infof("Not enough funds to buy tickets: (spendable: %v, balancetomaintain: %v) ",
+				bal.Spendable.ToCoin(), balanceToMaintainAmt.ToCoin())
+		}
+	*/
 	if toBuyForBlock <= 0 {
 		log.Infof("Not buying any tickets this round")
 		return ps, nil
 	}
 
-	// Check our balance versus the amount of tickets we need to buy.
-	// If there is not enough money, decrement and recheck the balance
-	// to see if fewer tickets may be purchased. Abort if we don't
-	// have enough moneys.
+	// safety check
 	notEnough := func(bal dcrutil.Amount, toBuy int, sd dcrutil.Amount) bool {
 		return (bal.ToCoin() - float64(toBuy)*sd.ToCoin()) <
 			balanceToMaintainAmt.ToCoin()
@@ -605,16 +659,11 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 		}
 	}
 
-	// When buying, do not exceed maxinmempool
-	if !t.cfg.DontWaitForTickets {
-		if toBuyForBlock+inMP > t.cfg.MaxInMempool {
-			toBuyForBlock = t.cfg.MaxInMempool - inMP
-			log.Debugf("Limiting to %d purchases so that maxinmempool is not exceeded", toBuyForBlock)
-		}
-	}
+	//
+	// Purchase tickets
+	//
 
-	// If an address wasn't passed, create an internal address in
-	// the wallet for the ticket address.
+	// If an address wasn't passed, create an internal address in the wallet for the ticket address
 	var ticketAddress dcrutil.Address
 	if t.ticketAddress != nil {
 		ticketAddress = t.ticketAddress
@@ -625,13 +674,10 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 			return ps, err
 		}
 	}
-
-	// Purchase tickets.
 	poolFeesAmt, err := dcrutil.NewAmount(t.cfg.PoolFees)
 	if err != nil {
 		return ps, err
 	}
-	// Ticket purchase requires 2 blocks to confirm
 	expiry := int32(int(height) + t.cfg.ExpiryDelta + 2)
 	hashes, err := t.wallet.PurchaseTickets(0,
 		maxPriceAmt,
@@ -658,13 +704,10 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 			"fees per KB used)", tickets[i], nextStakeDiff.ToCoin(),
 			feeToUseAmt.ToCoin())
 	}
-
 	bal, err = t.wallet.CalculateAccountBalance(account, 0)
 	if err != nil {
 		return ps, err
 	}
 	log.Debugf("Usable balance for account '%s' after purchases: %v", t.cfg.AccountName, bal.Spendable)
-	ps.Balance = int64(bal.Spendable)
-
 	return ps, nil
 }
