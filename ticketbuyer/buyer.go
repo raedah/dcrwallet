@@ -380,9 +380,9 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 	}
 
 	// config
-	BASE_RESERVE := 2.0         // amount of funds to keep in reserve measured by spendPerWindows
-	TARGET_SUPPORT := 0.2       // keep the price from dropping too rapidly, aim this much between avg and high
-	AUTO_TARGET_PRICE := 2000.0 // tunes the target price relative to the block height
+	BASE_RESERVE := 3.0         // amount of funds to keep in reserve measured by spendPerWindows
+	TARGET_SUPPORT := 0.15      // keep the price from dropping too rapidly, aim this much between avg and high
+	AUTO_TARGET_PRICE := 2100.0 // tunes the target price relative to the block height
 	MAX_PRICE_MULTIPLIER := 5.0 // scale up the max price when your reserve funds are growing
 
 	avgWinPeriods := float64(t.activeNet.TicketPoolSize) / float64(winSize) // win periods per investment maturity
