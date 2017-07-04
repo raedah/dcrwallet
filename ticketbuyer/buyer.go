@@ -771,6 +771,85 @@ func (t *TicketPurchaser) Purchase(height int64) (*PurchaseStats, error) {
 		}
 	}
 
+	// Limit the amount of tickets you are buying per block so you do not exceed the targetPrice
+	if true {
+		AUTO_TARGET_PRICE := 2100.0 // tunes the target price relative to the block height
+		targetPrice := float64(height) / AUTO_TARGET_PRICE
+
+		estStakeDiff, err := t.dcrdChainSvr.EstimateStakeDiff(nil)
+		if err != nil {
+			return ps, err
+		}
+		stakeDiff, err := t.wallet.StakeDifficulty()
+		if err != nil {
+			return ps, err
+		}
+		blocksRemaining := int(winSize) - t.idxDiffPeriod - 2
+		if blocksRemaining < 1 {
+			log.Infof("No blocks remaining to buy")
+			return ps, nil
+		}
+
+		purchaseSlotsLeftInWindow := blocksRemaining * maxStake
+		tixCanBuy := (float64(bal.Spendable) - balanceToMaintainAmt) / float64(stakeDiff)
+		if tixCanBuy < 0 {
+			tixCanBuy = 0
+		}
+		canBuyRatio := tixCanBuy / float64(purchaseSlotsLeftInWindow)
+		stakeDiffCanReach := ((estStakeDiff.Max - estStakeDiff.Min) * canBuyRatio) + estStakeDiff.Min
+		proportionPossible := (float64(t.stakeLive) + float64(tixCanBuy)) / float64(t.stakePoolSize)
+
+		// find the tickets needed to reach max price scale
+		needRatio := (targetPrice - estStakeDiff.Min) / (estStakeDiff.Max - estStakeDiff.Min)
+		needThisWindow := float64(purchaseSlotsLeftInWindow) * needRatio
+		willTargetStakeDiff := ((estStakeDiff.Max - estStakeDiff.Min) * needRatio) + estStakeDiff.Min
+		log.Infof("Want Target (price target: %.2f DCR: total tix: %.1f, tix per block: %.1f)",
+			willTargetStakeDiff, needThisWindow, float64(maxStake)*needRatio)
+
+		// if what we were planning to buy is greater then what we need to stay within
+		// our target price, then calc the new lower amount to buy per block and use that
+		var ratio float64
+		if canBuyRatio < needRatio {
+			ratio = canBuyRatio
+		} else {
+			ratio = needRatio
+		}
+
+		toBuyForBlockFloat := float64(maxStake) * ratio
+		if float64(toBuyForBlock) > toBuyForBlockFloat {
+			rand.Seed(time.Now().UTC().UnixNano())
+			toBuyForBlock = int(math.Floor(toBuyForBlockFloat))
+			ticketRemainder := toBuyForBlockFloat - math.Floor(toBuyForBlockFloat)
+			if rand.Float64() <= float64(ticketRemainder) {
+				toBuyForBlock++
+			}
+		} else {
+			// This is the case where the price target is so far out of reach
+			// that we just dont even bother trying
+			if stakeDiffCanReach/targetPrice < 1-proportionPossible {
+				return ps, fmt.Errorf("Not buying because can not reach price target")
+			}
+		}
+		// Log scale slope up for dynamic price target
+		exponent := 1 / ratio
+		if float64(blocksRemaining) < exponent {
+			exponent = float64(blocksRemaining)
+		}
+		log.Tracef("trace, canbuyRatio %v", canBuyRatio)
+		log.Tracef("trace, pre-ratio %+v", ratio)
+		ratio = math.Pow(ratio, exponent)
+		log.Tracef("trace, ratio %+v", ratio)
+		log.Tracef("trace, exponent %v", exponent)
+		toBuyForBlockFloat = float64(maxStake) * ratio
+		log.Infof("Log scale buying, %.8f now and slope up (log ratio: %.8f)", toBuyForBlockFloat, ratio)
+		rand.Seed(time.Now().UTC().UnixNano())
+		toBuyForBlock = int(math.Floor(toBuyForBlockFloat))
+		ticketRemainder := toBuyForBlockFloat - float64(toBuyForBlock)
+		if rand.Float64() <= float64(ticketRemainder) {
+			toBuyForBlock++
+		}
+	}
+
 	// Only the maximum number of tickets at each block
 	// should be purchased, as specified by the user.
 	if toBuyForBlock > maxPerBlock {
